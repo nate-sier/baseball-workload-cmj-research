@@ -73,7 +73,8 @@ def _numeric(values: pd.Series) -> pd.Series:
 
 
 def build_snapshot(pp_raw: pd.DataFrame, jumps_raw: pd.DataFrame, *, name_map: dict | None = None,
-                   blanks_are_zero: bool = False) -> tuple[pd.DataFrame, dict, pd.DataFrame]:
+                   blanks_are_zero: bool = False,
+                   duplicate_policy: str = "largest_total_distance") -> tuple[pd.DataFrame, dict, pd.DataFrame]:
     """Return (eligible snapshot, audit, within-session replicate trial data).
 
     All windows are calendar-day sums of recorded game load from days [test-W, test-1].
@@ -85,6 +86,8 @@ def build_snapshot(pp_raw: pd.DataFrame, jumps_raw: pd.DataFrame, *, name_map: d
     pp_required = ["batter", "game_date", "mlbam_game_pk", *LOADS[:3]]
     cols = {key: col(pp_raw, key, required=True, context="PP_Sprint") for key in pp_required}
     pp = pp_raw.copy()
+    # Google Sheets row numbers (worksheet header is row 1). Retain for auditing.
+    pp["_source_row"] = np.arange(len(pp)) + 2
     pp["game_date"] = _date(pp[cols["game_date"]])
     pp = pp[pp["game_date"].dt.year.eq(YEAR)].copy()
     pp["batter"] = pp[cols["batter"]].fillna("").astype(str).str.strip()
@@ -108,11 +111,82 @@ def build_snapshot(pp_raw: pd.DataFrame, jumps_raw: pd.DataFrame, *, name_map: d
         if pp[key].lt(0).any():
             raise ValueError(f"Negative game workload in {key}")
     game_key = ["player_key", "game_date", "game_id"]
-    clashes = pp.groupby(game_key)[list(LOADS[:3])].nunique(dropna=False)
-    if (clashes > 1).any(axis=1).any():
-        raise ValueError("Conflicting duplicate player/game rows in PP_Sprint; resolve before analysis")
-    n_dupes = int(pp.duplicated(game_key).sum())
-    pp = pp.drop_duplicates(game_key)
+    metric_keys = list(LOADS[:3])
+    if duplicate_policy not in {"largest_total_distance", "first_row", "last_row", "strict"}:
+        raise ValueError(f"Unrecognized duplicate-resolution policy: {duplicate_policy}")
+
+    # A game summary can be repeated in the Google Sheet (e.g., re-imported
+    # historical rows). Never SUM repeated rows for the same player/game:
+    # doing so would inflate both running volume and game counts.
+    is_duplicated = pp.duplicated(game_key, keep=False)
+    dupe_rows = pp.loc[is_duplicated].copy()
+    if not dupe_rows.empty:
+        varying = dupe_rows.groupby(game_key, sort=False)[metric_keys].nunique(dropna=False)
+        conflicted_keys = varying.index[(varying > 1).any(axis=1)]
+        # Using a MultiIndex on the exact group keys retains true doubleheaders.
+        key_index = pd.MultiIndex.from_frame(dupe_rows[game_key])
+        conflict_mask = key_index.isin(conflicted_keys)
+        n_conflicting_games = len(conflicted_keys)
+        n_conflicting_rows = int(conflict_mask.sum())
+        n_identical_duplicate_games = int(len(varying) - n_conflicting_games)
+    else:
+        n_conflicting_games = 0
+        n_conflicting_rows = 0
+        n_identical_duplicate_games = 0
+        conflict_mask = np.zeros(0, dtype=bool)
+
+    if n_conflicting_games and duplicate_policy == "strict":
+        raise ValueError(
+            f"{n_conflicting_games} player/game group(s) contain conflicting PP_Sprint workload values. "
+            "Select a duplicate-resolution policy in the sidebar to load the data; "
+            "review the conflict audit before interpreting results."
+        )
+
+    # A complete recorded game summary should not be summed with repeated
+    # source summaries. Default picks ONE coherent row, ordered by highest
+    # total distance, then max-effort distance, then run count. This is an
+    # assumption, not proof of which conflicting source row is correct.
+    if duplicate_policy == "largest_total_distance" or duplicate_policy == "strict":
+        ranked = pp.sort_values(
+            [*game_key, "distance_covered_yards", "max_effort_distance_covered_yards", "max_effort_runs", "_source_row"],
+            ascending=[True, True, True, False, False, False, False],
+            kind="stable",
+        )
+    elif duplicate_policy == "last_row":
+        ranked = pp.sort_values([*game_key, "_source_row"],
+                                ascending=[True, True, True, False], kind="stable")
+    else:  # first_row
+        ranked = pp.sort_values([*game_key, "_source_row"],
+                                ascending=[True, True, True, True], kind="stable")
+    pp_dedup = ranked.drop_duplicates(game_key, keep="first").copy()
+    n_dupes = int(len(pp) - len(pp_dedup))
+    n_conflicting_removed = (
+        int(n_conflicting_rows - n_conflicting_games) if n_conflicting_games else 0
+    )
+    n_identical_removed = n_dupes - n_conflicting_removed
+
+    # Preserve EVERY competing row with its worksheet row number and the
+    # chosen row. These details are displayed/downloadable in Data audit.
+    duplicate_details = []
+    if n_conflicting_games:
+        key_to_selected_row = {
+            (player_key, date, game_id): int(row_num)
+            for player_key, date, game_id, row_num in pp_dedup[game_key + ["_source_row"]].itertuples(index=False, name=None)
+        }
+        for r in dupe_rows.loc[conflict_mask, ["player_key", "batter", "game_date", "game_id", "_source_row", *metric_keys]].itertuples(index=False, name=None):
+            player, batter, date, game_id, row_num, effort_dist, dist, runs = r
+            duplicate_details.append({
+                "batter": batter,
+                "game_date": date.strftime("%Y-%m-%d"),
+                "mlbam_game_pk": game_id,
+                "Google Sheet row": int(row_num),
+                "max_effort_runs": float(runs),
+                "max_effort_distance_covered_yards": float(effort_dist),
+                "distance_covered_yards": float(dist),
+                "Selected for analysis": int(row_num) == key_to_selected_row[(player, date, game_id)],
+            })
+
+    pp = pp_dedup
     daily = (pp.groupby(["player_key", "game_date"], as_index=False)
              .agg(batter=("batter", "first"),
                   max_effort_distance_covered_yards=("max_effort_distance_covered_yards", "sum"),
@@ -192,7 +266,13 @@ def build_snapshot(pp_raw: pd.DataFrame, jumps_raw: pd.DataFrame, *, name_map: d
         "eligible_athlete_days": len(result), "excluded_player_days": before - len(result),
         "unmatched_pp_names": len(unmatched[unmatched["source"].eq("PP_Sprint")]),
         "unmatched_jump_names": len(unmatched[unmatched["source"].eq("Jump Data")]),
-        "exact_duplicate_games_removed": n_dupes,
+        "duplicate_rows_removed": n_dupes,
+        "exact_duplicate_games_removed": n_identical_removed,
+        "conflicting_duplicate_rows_removed": n_conflicting_removed,
+        "conflicting_duplicate_game_groups": n_conflicting_games,
+        "identical_duplicate_game_groups": n_identical_duplicate_games,
+        "duplicate_resolution_policy": duplicate_policy,
+        "_conflict_details": duplicate_details,
         "blank_game_metrics_treated_as_zero": blank_counts if blanks_are_zero else {},
         "found_jump_metrics": present,
     }
