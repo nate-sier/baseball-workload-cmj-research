@@ -85,6 +85,22 @@ source = st.sidebar.radio("Load from", ["Google Sheets", "Excel workbook"],
 name_map_file = st.sidebar.file_uploader("Optional name matching CSV (pp_batter,jump_athlete)", type="csv")
 allow_blanks = st.sidebar.checkbox("Missing game-load cells actually mean zero", value=False,
                                    help="Only enable if blanks really indicate zero recorded workload.")
+st.sidebar.markdown("**Repeated player/game records**")
+duplicate_choices = {
+    "Keep highest total-distance game summary (recommended starting point)": "largest_total_distance",
+    "Keep first row in the sheet": "first_row",
+    "Keep last row in the sheet": "last_row",
+    "Reject conflicting duplicates": "strict",
+}
+duplicate_choice = st.sidebar.selectbox(
+    "How should conflicting PP_Sprint rows be handled?",
+    options=list(duplicate_choices),
+    help=("The same athlete + game ID can appear multiple times with different recorded "
+          "workload values. This is a data-quality decision, not a statistical imputation. "
+          "The default keeps the single row with the largest total distance and NEVER adds "
+          "conflicting summaries together. The Data audit tab lists every conflicting row."),
+)
+duplicate_policy = duplicate_choices[duplicate_choice]
 name_map = {}
 if name_map_file:
     from data_pipeline import normalize_name
@@ -120,12 +136,16 @@ if load_clicked:
                     raise ValueError("Choose the Python Reports Excel workbook")
                 pp, jumps = read_workbook(uploaded.getvalue())
             snapshot, audit, trials = build_snapshot(pp, jumps, name_map=name_map,
-                                                    blanks_are_zero=allow_blanks)
+                                                    blanks_are_zero=allow_blanks,
+                                                    duplicate_policy=duplicate_policy)
         st.session_state["processed"] = (snapshot, audit, trials)
         st.session_state["source_label"] = source
     except Exception as exc:
         # Show exception type and sanitized human-readable content, not secret/key material.
         st.error(f"Data loading failed ({type(exc).__name__}): {str(exc)[:450]}")
+
+if "processed" in st.session_state and st.session_state["processed"][1].get("duplicate_resolution_policy") != duplicate_policy:
+    st.sidebar.info("Duplicate handling changed. Click **Load / refresh source data** to apply it.")
 
 if "processed" not in st.session_state:
     st.info("Start by clicking **Load / refresh source data** in the sidebar. "
@@ -134,6 +154,13 @@ if "processed" not in st.session_state:
     st.stop()
 
 snapshot, audit, trials = st.session_state["processed"]
+if audit.get("conflicting_duplicate_game_groups", 0):
+    st.warning(
+        f"PP_Sprint contained {audit['conflicting_duplicate_game_groups']:,} player/game groups "
+        f"with conflicting workload values. One row per game was retained using "
+        f"'{audit['duplicate_resolution_policy']}'. Review the **Data audit & methods** tab "
+        "and download the conflicting rows before interpreting the models."
+    )
 main1, main2, main3 = st.tabs(["Mixed-effects models", "Acute ≥5% drops", "Data audit & methods"])
 available = {label: metric for label, metric in JUMP_METRICS.items()
              if metric in snapshot and snapshot[metric].notna().any()}
@@ -270,10 +297,28 @@ with main3:
     c1.metric("Athletes", f"{audit['eligible_athletes']:,}")
     c2.metric("Eligible athlete-days", f"{audit['eligible_athlete_days']:,}")
     c3.metric("Excluded athlete-days", f"{audit['excluded_player_days']:,}")
-    st.json(audit)
+    st.json({k: v for k, v in audit.items() if not k.startswith("_")})
+    if audit.get("conflicting_duplicate_game_groups", 0):
+        st.warning(
+            "Conflicting duplicates were automatically resolved for loading, NOT verified as correct. "
+            "Before reporting research results, compare the selected and excluded rows against "
+            "the source provider or an authoritative game-level export. If they represent separate "
+            "game segments rather than repeated summaries, this rule may undercount workload."
+        )
+        conflicts = pd.DataFrame(audit.get("_conflict_details", []))
+        st.markdown("#### Conflicting PP_Sprint player/game rows")
+        st.caption("Sheet row numbers include the header as row 1. Selected=True identifies the "
+                   "one entire game row used for analysis; repeated observations were NOT summed.")
+        st.dataframe(conflicts, use_container_width=True, hide_index=True)
+        st.download_button(
+            "Download duplicate-conflict audit (CSV)",
+            conflicts.to_csv(index=False).encode("utf-8-sig"),
+            file_name="pp_sprint_duplicate_conflicts_2026.csv",
+            mime="text/csv",
+        )
     st.markdown("**Important methods notes**")
     st.markdown("- Matches `PP_Sprint.batter` to `Jump Data.Athlete` by normalized name. Check unmatched counts; provide a mapping CSV if necessary. This is not a verified MLBAM ID linkage.\n"
-                "- Combines doubleheaders by player and date, removing exact duplicate game rows.\n"
+                "- Combines verified distinct game IDs for doubleheaders; repeats of one player/game use the selected duplicate-resolution rule. All conflicting source rows are auditable.\n"
                 "- Excludes same-day game loads; requires 28 days after the first observed game for each athlete, and stops no later than the day after their last recorded game.\n"
                 "- Missing game-date rows **inside** coverage are interpreted as zero *recorded* game load. They may also represent gaps in the source.\n"
                 "- Averaging replicate trials on a date produces one jump observation per athlete-day.\n"
